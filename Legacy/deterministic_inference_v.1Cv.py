@@ -1,0 +1,832 @@
+#!/usr/bin/env python3
+"""
+deterministic_inference_v.1Cv.py
+
+Deterministic inference harness v1Cv
+
+- Deterministic-friendly TF settings
+- CLI flag --batch_size controls model.predict batch size
+- BOM-tolerant scaler loading (joblib/pickle/json utf-8-sig)
+- Optional k-fold and rolling CV
+- Atomic writes and dual-case SHA sidecars
+- Produces per-fold preds and a top-level manifest
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import platform
+import random
+import sys
+import tempfile
+import traceback
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+# Try to set deterministic TF environment variables early
+os.environ.setdefault("TF_DETERMINISTIC_OPS", "1")
+os.environ.setdefault("TF_CUDNN_DETERMINISTIC", "1")
+
+# Lazy imports for heavy libs
+_tf_available = True
+try:
+    import tensorflow as tf  # type: ignore
+except Exception:
+    _tf_available = False
+
+try:
+    import numpy as np  # type: ignore
+except Exception:
+    np = None  # type: ignore
+
+# -------------------------
+# Filesystem helpers
+# -------------------------
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
+
+
+def _fsync_dir(path: Path) -> None:
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except Exception:
+        pass
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as tf:
+        tf.write(data)
+        tf.flush()
+        try:
+            os.fsync(tf.fileno())
+        except Exception:
+            pass
+    os.replace(tf.name, str(path))
+    _fsync_dir(path.parent)
+
+
+def atomic_write_json(path: Path, obj: Any, *, indent: int = 2) -> None:
+    data = json.dumps(obj, sort_keys=True, indent=indent).encode("utf-8")
+    _atomic_write_bytes(path, data)
+
+
+def atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
+    _atomic_write_bytes(path, text.encode(encoding))
+
+
+# -------------------------
+# SHA helpers and sidecars
+# -------------------------
+def compute_sha256_hex(path: Path, *, uppercase: bool = False, chunk_size: int = 8192) -> str:
+    if not path.exists():
+        raise FileNotFoundError(f"Path missing for SHA: {path}")
+    if path.is_dir():
+        raise IsADirectoryError(f"compute_sha256_hex expects a file, got directory: {path}")
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(chunk_size), b""):
+            h.update(chunk)
+    hexv = h.hexdigest()
+    return hexv.upper() if uppercase else hexv.lower()
+
+
+def compute_path_sha(path: Path, *, uppercase: bool = False, chunk_size: int = 8192) -> str:
+    if not path.exists():
+        raise FileNotFoundError(f"Path missing for directory/file SHA: {path}")
+    h = hashlib.sha256()
+    if path.is_file():
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(chunk_size), b""):
+                h.update(chunk)
+    else:
+        base = path
+        for root, dirs, files in os.walk(base):
+            dirs.sort()
+            files.sort()
+            for fname in files:
+                fpath = Path(root) / fname
+                rel = str(fpath.relative_to(base)).replace(os.sep, "/").encode("utf-8")
+                h.update(rel)
+                with fpath.open("rb") as fh:
+                    for chunk in iter(lambda: fh.read(chunk_size), b""):
+                        h.update(chunk)
+    hexv = h.hexdigest()
+    return hexv.upper() if uppercase else hexv.lower()
+
+
+def write_sidecars_both(path: Path) -> Tuple[str, str]:
+    lower = compute_path_sha(path, uppercase=False)
+    upper = lower.upper()
+    lower_side = path.with_name(path.name + ".sha256.txt")
+    upper_side = path.with_name(path.name + ".SHA256.TXT")
+    if str(lower_side).lower() == str(upper_side).lower():
+        lower_side.write_text(lower + "\n" + upper + "\n", encoding="ascii")
+        return lower, upper
+    lower_side.write_text(lower + "\n", encoding="ascii")
+    upper_side.write_text(upper + "\n", encoding="ascii")
+    return lower, upper
+
+
+# -------------------------
+# Deterministic seeding
+# -------------------------
+def deterministic_seed_all(seed: int) -> Dict[str, Any]:
+    measures = {
+        "PYTHONHASHSEED_set": None,
+        "numpy_seed_set": None,
+        "tf_seed_set": None,
+        "tf_threading_set": None,
+        "TF_DETERMINISTIC_OPS": os.environ.get("TF_DETERMINISTIC_OPS"),
+        "TF_CUDNN_DETERMINISTIC": os.environ.get("TF_CUDNN_DETERMINISTIC"),
+    }
+    try:
+        os.environ["PYTHONHASHSEED"] = str(int(seed))
+        measures["PYTHONHASHSEED_set"] = str(int(seed))
+    except Exception:
+        pass
+    try:
+        random.seed(int(seed))
+        if np is not None:
+            np.random.seed(int(seed))
+            measures["numpy_seed_set"] = int(seed)
+    except Exception:
+        pass
+    if _tf_available:
+        try:
+            import tensorflow as tf  # type: ignore
+
+            tf.random.set_seed(int(seed))
+            measures["tf_seed_set"] = int(seed)
+            try:
+                tf.config.threading.set_intra_op_parallelism_threads(1)
+                tf.config.threading.set_inter_op_parallelism_threads(1)
+                measures["tf_threading_set"] = True
+            except Exception:
+                measures["tf_threading_set"] = False
+        except Exception:
+            pass
+    return measures
+
+
+# -------------------------
+# Scaler loading (joblib/pickle/json BOM tolerant)
+# -------------------------
+def load_scaler_any(path: Path):
+    if not path.exists():
+        raise FileNotFoundError(f"Scaler not found: {path}")
+    try:
+        import joblib  # type: ignore
+    except Exception:
+        joblib = None
+    if joblib is not None:
+        try:
+            return joblib.load(str(path))
+        except Exception:
+            pass
+    try:
+        import pickle  # type: ignore
+
+        with path.open("rb") as fh:
+            return pickle.load(fh)
+    except Exception:
+        pass
+    try:
+        with path.open("r", encoding="utf-8-sig") as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
+# -------------------------
+# Feature engineering and scaling helpers
+# -------------------------
+def compute_engineered_features(df):
+    if "Close" not in df.columns:
+        raise KeyError("Input CSV must contain 'Close' column.")
+    df = df.copy()
+    df["PrevClose"] = df["Close"].shift(1).bfill()
+    df["Close_3d_mean"] = df["Close"].rolling(window=3, min_periods=1).mean()
+    df["Close_7d_mean"] = df["Close"].rolling(window=7, min_periods=1).mean()
+    return df
+
+
+def map_scaler_features_to_csv(scaler: Dict, df_cols: List[str]) -> Tuple[List[str], List[str]]:
+    csv_map = {c.lower(): c for c in df_cols}
+    feat_cols = scaler.get("feature_cols", []) if isinstance(scaler, dict) else []
+    mapped = []
+    missing = []
+    for f in feat_cols:
+        key = f.lower()
+        if key in csv_map:
+            mapped.append(csv_map[key])
+        else:
+            missing.append(f)
+    return mapped, missing
+
+
+def apply_feature_scaling_numpy(X, selected_feats: List[str], scaler: Dict):
+    if not isinstance(scaler, dict):
+        return X
+    if "mu" in scaler and "sigma" in scaler and "feature_cols" in scaler:
+        scaler_map = {
+            name.lower(): (float(mu), float(sig))
+            for name, mu, sig in zip(scaler["feature_cols"], scaler["mu"], scaler["sigma"])
+        }
+        mu_list = []
+        sigma_list = []
+        for f in selected_feats:
+            key = f.lower()
+            if key in scaler_map:
+                mu_list.append(scaler_map[key][0])
+                sigma_list.append(scaler_map[key][1])
+            else:
+                mu_list.append(0.0)
+                sigma_list.append(1.0)
+        mu = np.array(mu_list, dtype=float)
+        sigma = np.array(sigma_list, dtype=float)
+        return (X - mu) / (sigma + 1e-12)
+    return X
+
+
+def inverse_transform_preds(preds_std, scaler):
+    if isinstance(scaler, dict) and "target_mu" in scaler and "target_sigma" in scaler:
+        tmu = float(scaler["target_mu"])
+        tsig = float(scaler["target_sigma"])
+        return preds_std * tsig + tmu
+    try:
+        tmu = getattr(scaler, "target_mu", None)
+        tsig = getattr(scaler, "target_sigma", None)
+        if tmu is not None and tsig is not None:
+            return preds_std * float(tsig) + float(tmu)
+    except Exception:
+        pass
+    if isinstance(scaler, dict) and "feature_cols" in scaler and "mu" in scaler and "sigma" in scaler:
+        try:
+            idx = [c.lower() for c in scaler["feature_cols"]].index("close")
+            mu_close = float(scaler["mu"][idx])
+            sigma_close = float(scaler["sigma"][idx])
+            return preds_std * sigma_close + mu_close
+        except Exception:
+            pass
+    return preds_std
+
+
+# -------------------------
+# CV helpers (k-fold and rolling skeleton)
+# -------------------------
+def generate_cv_splits(n_rows: int, mode: Optional[str], k: Optional[int], window: Optional[int], step: Optional[int], seed: int):
+    if mode is None:
+        return [("single", list(range(n_rows)))]
+    if mode == "kfold":
+        if k is None or k < 2:
+            raise ValueError("kfold requires --cv-k >= 2")
+        idx = list(range(n_rows))
+        random.Random(seed).shuffle(idx)
+        folds = []
+        base = n_rows // k
+        extras = n_rows % k
+        start = 0
+        for i in range(k):
+            size = base + (1 if i < extras else 0)
+            folds.append(idx[start:start + size])
+            start += size
+        splits = []
+        for i in range(k):
+            test = sorted(folds[i])
+            train = sorted([x for j, f in enumerate(folds) if j != i for x in f])
+            splits.append((train, test))
+        return splits
+    if mode == "rolling":
+        if window is None or step is None:
+            raise ValueError("rolling requires --cv-window and --cv-step")
+        splits = []
+        start = 0
+        while start + window < n_rows:
+            train_idx = list(range(start, start + window))
+            test_idx = [start + window]
+            splits.append((train_idx, test_idx))
+            start += step
+        return splits
+    raise ValueError("Unsupported cv mode")
+
+
+# -------------------------
+# IO: preds and metrics
+# -------------------------
+def compute_metrics_and_save(preds: "np.ndarray", dates: List[str], y_true: "np.ndarray", outdir: Path):
+    preds_aligned = preds[: len(y_true)]
+    if len(y_true) == 0:
+        mae_ann = float("nan")
+        rmse_ann = float("nan")
+        mae_naive = float("nan")
+        rmse_naive = float("nan")
+    else:
+        naive_vals = np.concatenate(([y_true[0]], y_true[:-1])) if len(y_true) > 0 else np.array([])
+        mae_ann = float(np.mean(np.abs(preds_aligned - y_true)))
+        rmse_ann = float(np.sqrt(np.mean((preds_aligned - y_true) ** 2)))
+        mae_naive = float(np.mean(np.abs(naive_vals - y_true))) if len(naive_vals) > 0 else float("nan")
+        rmse_naive = float(np.sqrt(np.mean((naive_vals - y_true) ** 2))) if len(naive_vals) > 0 else float("nan")
+
+    preds_df_text = "Date,y_true,pred,pred_denorm\n"
+    for d, y, p in zip(dates, y_true, preds_aligned):
+        preds_df_text += f"{d},{y},{p},{p}\n"
+    atomic_write_text(outdir / "preds.csv", preds_df_text, encoding="utf-8")
+
+    metrics_text = (
+        f"ANN_MAE: {mae_ann:.6f}\nANN_RMSE: {rmse_ann:.6f}\nNaive_MAE: {mae_naive:.6f}\nNaive_RMSE: {rmse_naive:.6f}\n"
+    )
+    atomic_write_text(outdir / "metrics.txt", metrics_text, encoding="utf-8")
+
+
+# -------------------------
+# Manifest helpers
+# -------------------------
+def _env_versions():
+    py_ver = sys.version.split()[0]
+    tf_ver = None
+    np_ver = None
+    try:
+        import tensorflow as tf  # type: ignore
+
+        tf_ver = tf.__version__
+    except Exception:
+        tf_ver = None
+    try:
+        import numpy as np  # type: ignore
+
+        np_ver = np.__version__
+    except Exception:
+        np_ver = None
+    return {
+        "python_version": py_ver,
+        "tensorflow_version": tf_ver,
+        "numpy_version": np_ver,
+        "platform": platform.platform(),
+    }
+
+
+def validate_manifest_basic(man: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+    required_keys = [
+        "manifest_version",
+        "mode",
+        "commodity",
+        "seed",
+        "timestamp",
+        "environment",
+        "outputs",
+        "input_files",
+    ]
+    for k in required_keys:
+        if k not in man:
+            return False, f"Manifest missing key: {k}"
+    outs = man.get("outputs", {})
+    if "preds" not in outs or "preds_sha_lower" not in outs or "preds_sha_upper" not in outs:
+        return False, "Manifest outputs incomplete"
+    preds_path = Path(outs["preds"])
+    if not preds_path.exists():
+        return False, f"Preds file not found: {preds_path}"
+    for s in (outs["preds_sha_lower"], outs["preds_sha_upper"]):
+        if not isinstance(s, str) or len(s) != 64 or any(c not in "0123456789abcdefABCDEF" for c in s):
+            return False, "Preds SHA not valid hex string length=64"
+    return True, None
+
+
+# -------------------------
+# Core inference API
+# -------------------------
+def infer_with_model_v1c(
+    model_path: Optional[str],
+    input_csvs: Dict[str, str],
+    outdir: str,
+    *,
+    seed: int = 20251117,
+    scaler_path: Optional[str] = None,
+    enforce_shas: Optional[Dict[str, str]] = None,
+    mode: str = "deterministic",
+    commodity: str = "GENERIC",
+    model_sha_override: Optional[str] = None,
+    debug: bool = False,
+    verbose: bool = True,
+    no_inverse_flag: bool = False,
+    batch_size: int = 32,
+    cv_mode: Optional[str] = None,
+    cv_k: Optional[int] = None,
+    cv_window: Optional[int] = None,
+    cv_step: Optional[int] = None,
+) -> Dict[str, Any]:
+    outdir_p = Path(outdir)
+    outdir_p.mkdir(parents=True, exist_ok=True)
+
+    def _log(*args):
+        if verbose:
+            eprint(*args)
+
+    # Validate inputs and optional enforced SHAs
+    mismatches = []
+    for role, p in input_csvs.items():
+        ppath = Path(p)
+        if not ppath.exists():
+            raise FileNotFoundError(f"Missing input CSV {role}: {ppath}")
+        if enforce_shas and role in enforce_shas:
+            expected = enforce_shas[role].strip()
+            actual_upper = compute_sha256_hex(ppath, uppercase=True)
+            actual_lower = actual_upper.lower()
+            if expected not in (actual_upper, actual_lower):
+                mismatches.append((role, str(ppath), expected, actual_upper))
+    if mismatches:
+        details = "; ".join([f"{r} expected {e} got {a}" for (r, _, e, a) in mismatches])
+        raise RuntimeError("SHA MISMATCH: " + details)
+
+    measures = deterministic_seed_all(seed)
+    determinism_level = "best_effort"
+    _log("RUN_INFO: deterministic_seed", seed, f"determinism_level={determinism_level}")
+    env_info = _env_versions()
+
+    # Synthetic mode shortcut
+    if mode == "synthetic":
+        preds_obj = {
+            "run_id": outdir_p.name,
+            "commodity": commodity,
+            "mode": "synthetic",
+            "seed": int(seed),
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "preds": [{"id": "SYNTH_1", "score": 0.12345}],
+        }
+        preds_path = outdir_p / "preds_model.json"
+        atomic_write_json(preds_path, preds_obj)
+        lower_sha, upper_sha = write_sidecars_both(preds_path)
+        manifest = {
+            "manifest_version": "1Ciii-closure",
+            "harness_version": "v1Cv",
+            "model_type": None,
+            "run_id": outdir_p.name,
+            "commodity": commodity,
+            "mode": "synthetic",
+            "seed": int(seed),
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "determinism_level": determinism_level,
+            "determinism_measures": measures,
+            "environment": env_info,
+            "input_files": {k: str(Path(v).resolve()) for k, v in input_csvs.items()},
+            "input_shas": enforce_shas or {},
+            "feature_columns": [],
+            "outputs": {"preds": str(preds_path), "preds_sha_lower": lower_sha, "preds_sha_upper": upper_sha},
+        }
+        manifest_path = outdir_p / f"run_manifest.{outdir_p.name}.inference.json"
+        atomic_write_json(manifest_path, manifest)
+        write_sidecars_both(manifest_path)
+        ok, msg = validate_manifest_basic(manifest)
+        if not ok:
+            raise RuntimeError(f"Manifest validation failed: {msg}")
+        _log("RUN_INFO: synthetic_complete", str(preds_path), lower_sha)
+        return {
+            "status": "SUCCESS",
+            "preds_path": str(preds_path),
+            "preds_sha_lower": lower_sha,
+            "preds_sha_upper": upper_sha,
+            "manifest": str(manifest_path),
+            "mode": "synthetic",
+        }
+
+    if not _tf_available:
+        raise RuntimeError("TensorFlow not available; cannot run deterministic inference in model mode")
+
+    # Load scaler if provided
+    scaler_obj = None
+    scaler_sha_upper = None
+    if scaler_path:
+        sp = Path(scaler_path)
+        if not sp.exists():
+            raise FileNotFoundError(f"Scaler not found: {sp}")
+        scaler_sha_upper = compute_sha256_hex(sp, uppercase=True)
+        scaler_obj = load_scaler_any(sp)
+        if scaler_obj is None:
+            _log("RUN_WARN: failed_loading_scaler; continuing without scaler")
+
+    # Load model
+    model_p = Path(model_path) if model_path else None
+    if model_p is None or not model_p.exists():
+        raise FileNotFoundError(f"Model path not found or not provided: {model_path}")
+    model_type = "directory" if model_p.is_dir() else "file"
+    try:
+        import tensorflow as tf  # type: ignore
+
+        model = tf.keras.models.load_model(str(model_p))
+        _log("RUN_INFO: model_loaded", str(model_p), f"type={model_type}")
+    except Exception as e:
+        raise RuntimeError(f"Failed to load model at {model_p} (type={model_type}): {e}") from e
+
+    # Determine test CSV
+    test_csv = None
+    for candidate in ("test", "testing", "val", "validation"):
+        if candidate in input_csvs:
+            test_csv = Path(input_csvs[candidate])
+            break
+    if test_csv is None:
+        test_csv = Path(next(iter(input_csvs.values())))
+    if not test_csv.exists():
+        raise FileNotFoundError(f"Test CSV not found: {test_csv}")
+
+    # Read CSV and compute features
+    try:
+        import pandas as pd  # local import
+    except Exception:
+        raise RuntimeError("pandas is required for CSV processing")
+    try:
+        df = pd.read_csv(test_csv, parse_dates=["Date"]).sort_values("Date").reset_index(drop=True)
+    except Exception as e:
+        raise RuntimeError(f"Failed to read test CSV: {e}") from e
+    try:
+        df = compute_engineered_features(df)
+    except Exception as e:
+        raise RuntimeError(f"Failed to compute engineered features: {e}") from e
+
+    # Feature selection
+    feature_cols: List[str] = []
+    if isinstance(scaler_obj, dict) and "feature_cols" in scaler_obj:
+        mapped, missing = map_scaler_features_to_csv(scaler_obj, list(df.columns))
+        if missing:
+            _log("RUN_WARN: Some scaler features missing from CSV:", missing)
+        feature_cols = mapped
+    if not feature_cols:
+        feature_cols = [c for c in df.columns if c not in ("Date", "Close") and pd.api.types.is_numeric_dtype(df[c])]
+        _log("RUN_INFO: falling back to CSV numeric columns for features")
+    try:
+        # Determine expected input width
+        if isinstance(model.input_shape, tuple):
+            N_expected = int(model.input_shape[1])
+        else:
+            N_expected = int(model.inputs[0].shape[1])
+    except Exception:
+        raise RuntimeError("Unable to determine model input shape.")
+    if len(feature_cols) < N_expected:
+        raise RuntimeError(f"Feature list length {len(feature_cols)} is less than model expected {N_expected}. Update scaler or model.")
+    selected = feature_cols[:N_expected]
+    _log("RUN_INFO: Selecting features for inference:", selected)
+
+    # CV splits
+    n_rows = len(df)
+    splits = generate_cv_splits(n_rows, cv_mode, cv_k, cv_window, cv_step, seed)
+    per_fold_metrics: List[Tuple[int, Path]] = []
+    per_fold_preds: List[Tuple[int, Path]] = []
+
+    for fold_idx, split in enumerate(splits, start=1):
+        if cv_mode is None:
+            train_idx, test_idx = list(range(n_rows)), list(range(n_rows))
+        else:
+            train_idx, test_idx = split
+        df_fold = df.copy().reset_index(drop=True)
+        X = df_fold[selected].astype(float).values
+        # Apply scaler to features
+        if scaler_obj is not None:
+            try:
+                if hasattr(scaler_obj, "transform"):
+                    Xn = scaler_obj.transform(X)
+                elif isinstance(scaler_obj, dict):
+                    Xn = apply_feature_scaling_numpy(X, selected, scaler_obj)
+                else:
+                    Xn = X
+            except Exception as e:
+                _log("RUN_WARN: scaler transform failed; continuing with raw features", str(e))
+                Xn = X
+        else:
+            Xn = X
+        # Predict
+        try:
+            preds_raw = model.predict(Xn, batch_size=batch_size).reshape(-1)
+        except Exception as e:
+            raise RuntimeError(f"Model prediction failed on fold {fold_idx}: {e}") from e
+        # Decide inverse per-run
+        skip_inverse = bool(no_inverse_flag)
+        if not skip_inverse and isinstance(scaler_obj, dict):
+            try:
+                if scaler_obj.get("target_type") == "denorm":
+                    skip_inverse = True
+            except Exception:
+                pass
+        if skip_inverse:
+            preds_denorm = preds_raw
+        else:
+            preds_denorm = inverse_transform_preds(preds_raw, scaler_obj)
+        preds_denorm = np.asarray(preds_denorm, dtype=float)
+        # Align y_true and dates for test indices
+        test_idx_sorted = sorted(test_idx)
+        dates = df_fold["Date"].astype(str).values[test_idx_sorted].tolist()
+        y_true = df_fold["Close"].values[test_idx_sorted]
+        preds_for_test = preds_denorm[test_idx_sorted]
+        # Save per-fold outputs into subdir
+        fold_out = outdir_p / f"fold_{fold_idx}"
+        fold_out.mkdir(parents=True, exist_ok=True)
+        compute_metrics_and_save(preds_for_test, dates, y_true, fold_out)
+        # Write preds_model.json for fold
+        preds_obj = {
+            "run_id": outdir_p.name,
+            "commodity": commodity,
+            "mode": "deterministic",
+            "seed": int(seed),
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "fold": fold_idx,
+            "preds": [{"row": int(i), "score": float(p)} for i, p in enumerate(preds_for_test.tolist())],
+        }
+        preds_path = fold_out / "preds_model.json"
+        atomic_write_json(preds_path, preds_obj)
+        lower_sha, upper_sha = write_sidecars_both(preds_path)
+        per_fold_metrics.append((fold_idx, fold_out / "metrics.txt"))
+        per_fold_preds.append((fold_idx, preds_path))
+        _log(f"RUN_INFO: fold {fold_idx} complete, preds: {preds_path}, sha: {lower_sha}")
+
+    # Aggregate summary
+    summary_metrics = []
+    for (fi, mpath) in per_fold_metrics:
+        try:
+            txt = mpath.read_text(encoding="utf-8")
+            summary_metrics.append((fi, txt))
+        except Exception:
+            summary_metrics.append((fi, None))
+    summary_path = outdir_p / "metrics_cv_summary.txt"
+    summary_text = f"harness_version: v1Cv\nfolds: {len(per_fold_metrics)}\n\n"
+    for fi, txt in summary_metrics:
+        summary_text += f"--- fold {fi} metrics ---\n"
+        summary_text += (txt or "MISSING") + "\n"
+    atomic_write_text(summary_path, summary_text, encoding="utf-8")
+
+    # Write top-level manifest referencing per-fold artifacts
+    preds_master = outdir_p / "preds_model_all_folds.json"
+    master_preds = {
+        "run_id": outdir_p.name,
+        "commodity": commodity,
+        "mode": "deterministic",
+        "seed": int(seed),
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "harness_version": "v1Cv",
+        "folds": [{"fold": fi, "preds": str(pp.resolve())} for fi, pp in per_fold_preds],
+    }
+    atomic_write_json(preds_master, master_preds)
+    lower_sha, upper_sha = write_sidecars_both(preds_master)
+
+    model_sha_upper = model_sha_override.strip().upper() if model_sha_override else compute_path_sha(model_p, uppercase=True)
+    manifest = {
+        "manifest_version": "1Ciii-closure",
+        "harness_version": "v1Cv",
+        "model_type": model_type,
+        "run_id": outdir_p.name,
+        "commodity": commodity,
+        "mode": "deterministic",
+        "seed": int(seed),
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "determinism_level": determinism_level,
+        "determinism_measures": measures,
+        "environment": env_info,
+        "model_path": str(model_p.resolve()),
+        "model_sha_upper": model_sha_upper,
+        "scaler_path": str(scaler_path) if scaler_path else None,
+        "scaler_sha_upper": scaler_sha_upper,
+        "input_files": {k: str(Path(v).resolve()) for k, v in input_csvs.items()},
+        "input_shas": enforce_shas or {},
+        "feature_columns": selected,
+        "outputs": {"preds": str(preds_master), "preds_sha_lower": lower_sha, "preds_sha_upper": upper_sha},
+    }
+    manifest_path = outdir_p / f"run_manifest.{outdir_p.name}.inference.json"
+    atomic_write_json(manifest_path, manifest)
+    write_sidecars_both(manifest_path)
+    ok, msg = validate_manifest_basic(manifest)
+    if not ok:
+        raise RuntimeError(f"Manifest validation failed: {msg}")
+
+    _log("RUN_INFO: inference_complete", str(preds_master), lower_sha)
+    return {
+        "status": "SUCCESS",
+        "preds_path": str(preds_master),
+        "preds_sha_lower": lower_sha,
+        "preds_sha_upper": upper_sha,
+        "manifest": str(manifest_path),
+        "model_sha_upper": manifest["model_sha_upper"],
+        "mode": "deterministic",
+    }
+
+
+# -------------------------
+# CLI wrapper
+# -------------------------
+def _cli_main(argv: Optional[list] = None) -> int:
+    parser = argparse.ArgumentParser(description="Deterministic inference harness v1Cv")
+    parser.add_argument("--model", required=False, help="Path to model artifact (h5 or SavedModel dir)")
+    parser.add_argument("--outdir", required=True, help="Output directory for preds and manifest")
+    parser.add_argument("--mode", choices=["deterministic", "synthetic"], default="deterministic", help="Run mode")
+    parser.add_argument("--seed", type=int, default=20251117, help="Deterministic seed")
+    parser.add_argument("--scaler", required=False, help="Optional scaler path (joblib/pickle/json)")
+    parser.add_argument("--commodity", required=False, default="GENERIC", help="Commodity short name (e.g., HO, GOLD)")
+    parser.add_argument("--enforce-sha", action="append", help="Enforce input CSV SHA in the form role=SHA (can be repeated)")
+    parser.add_argument("--train_csv", required=False, help="Training CSV path")
+    parser.add_argument("--val_csv", required=False, help="Validation CSV path")
+    parser.add_argument("--test_csv", required=False, help="Test CSV path")
+    parser.add_argument("--debug", action="store_true", help="Print full tracebacks on error")
+    parser.add_argument("--model-sha", required=False, help="Override model SHA (precomputed)")
+    parser.add_argument("--no-inverse", action="store_true", help="Treat model outputs as already denormalized; skip inverse transform")
+    parser.add_argument("--cv-mode", choices=["kfold", "rolling"], required=False, help="Cross-validation mode")
+    parser.add_argument("--cv-k", type=int, required=False, help="k for k-fold CV")
+    parser.add_argument("--cv-window", type=int, required=False, help="window size for rolling CV")
+    parser.add_argument("--cv-step", type=int, required=False, help="step for rolling CV")
+    parser.add_argument("--batch_size", type=int, default=32, help="Batch size for predict")
+    args = parser.parse_args(argv)
+
+    eprint(
+        "RUN_INFO:",
+        f"version=v1Cv",
+        f"date={datetime.utcnow().date().isoformat()}",
+        f"commodity={args.commodity}",
+        f"mode={args.mode}",
+        f"outdir={args.outdir}",
+    )
+
+    input_csvs: Dict[str, str] = {}
+    if args.train_csv:
+        input_csvs["train"] = args.train_csv
+    if args.val_csv:
+        input_csvs["val"] = args.val_csv
+    if args.test_csv:
+        input_csvs["test"] = args.test_csv
+
+    missing_markers: Dict[str, str] = {}
+    if not input_csvs:
+        base = Path.cwd()
+        cand_dir = base / f"data_{args.commodity.lower()}"
+        cand_train = cand_dir / f"{args.commodity.lower()}_training.csv"
+        cand_val = cand_dir / f"{args.commodity.lower()}_validation.csv"
+        cand_test = cand_dir / f"{args.commodity.lower()}_testing.csv"
+        if cand_train.exists():
+            input_csvs["train"] = str(cand_train)
+        else:
+            missing_markers["train"] = "MISSING"
+        if cand_val.exists():
+            input_csvs["val"] = str(cand_val)
+        else:
+            missing_markers["val"] = "MISSING"
+        if cand_test.exists():
+            input_csvs["test"] = str(cand_test)
+        else:
+            missing_markers["test"] = "MISSING"
+
+    enforce_shas = {}
+    if args.enforce_sha:
+        for item in args.enforce_sha:
+            if "=" in item:
+                role, sha = item.split("=", 1)
+                enforce_shas[role.strip()] = sha.strip()
+
+    model_sha_override = args.model_sha.strip() if args.model_sha else None
+
+    try:
+        result = infer_with_model_v1c(
+            model_path=args.model,
+            input_csvs=input_csvs,
+            outdir=args.outdir,
+            seed=args.seed,
+            scaler_path=args.scaler,
+            enforce_shas=enforce_shas or None,
+            mode=args.mode,
+            commodity=args.commodity,
+            model_sha_override=model_sha_override,
+            debug=args.debug,
+            verbose=True,
+            no_inverse_flag=args.no_inverse,
+            batch_size=args.batch_size,
+            cv_mode=args.cv_mode,
+            cv_k=args.cv_k,
+            cv_window=args.cv_window,
+            cv_step=args.cv_step,
+        )
+        if missing_markers:
+            result["missing_inputs"] = missing_markers
+        print(json.dumps(result, indent=2))
+        return 0
+    except Exception as exc:
+        eprint("RUN_ERROR:", str(exc))
+        if args.debug:
+            eprint(traceback.format_exc())
+        failure = {
+            "status": "FAILURE",
+            "error": str(exc),
+            "commodity": args.commodity,
+            "mode": args.mode,
+            "outdir": args.outdir,
+            "missing_inputs": missing_markers or {},
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        }
+        print(json.dumps(failure, indent=2))
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(_cli_main())
+
+
+

@@ -1,0 +1,4 @@
+*.keras
+preds.json
+RUNLOG.json
+__pycache__/

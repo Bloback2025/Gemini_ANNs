@@ -1,0 +1,17 @@
+{
+  "Open": {
+    "ablation_mae": 6.596077485103531
+  },
+  "High": {
+    "ablation_mae": 7.850773802981434
+  },
+  "Low": {
+    "ablation_mae": 4.904852668792603
+  },
+  "Close": {
+    "ablation_mae": 13.834327000533559
+  },
+  "PrevClose": {
+    "ablation_mae": 0.38213474896799515
+  }
+}

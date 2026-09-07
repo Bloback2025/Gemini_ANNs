@@ -1,0 +1,6 @@
+metrics_path,ann_mae
+C:\Users\loweb\AI_Financial_Sims\HO\HO_train_phase_ANNs\artifact_archive\repro_20251225_155604\ablation_sim_Close\metrics.txt,13.600425
+C:\Users\loweb\AI_Financial_Sims\HO\HO_train_phase_ANNs\artifact_archive\repro_20251225_155604\ablation_sim_High\metrics.txt,11.104514
+C:\Users\loweb\AI_Financial_Sims\HO\HO_train_phase_ANNs\artifact_archive\repro_20251225_155604\ablation_sim_Low\metrics.txt,7.337743
+C:\Users\loweb\AI_Financial_Sims\HO\HO_train_phase_ANNs\artifact_archive\repro_20251225_155604\ablation_sim_Open\metrics.txt,2.57257
+C:\Users\loweb\AI_Financial_Sims\HO\HO_train_phase_ANNs\artifact_archive\repro_20251225_155604\inference_out\metrics.txt,2.049623
