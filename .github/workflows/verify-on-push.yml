@@ -1,0 +1,69 @@
+﻿name: Verify Manifests
+
+on:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Prepare secure key secret
+        shell: powershell
+        run: |
+          mkdir -Force C:\secure\signing_keys
+          '${{ secrets.ED25519_KEY }}' | Out-File -FilePath C:\secure\signing_keys\ed25519_key.pem -Encoding ascii
+          icacls "C:\secure\signing_keys\ed25519_key.pem" /inheritance:r
+          icacls "C:\secure\signing_keys\ed25519_key.pem" /grant:r "$($env:USERNAME):(R)" "SYSTEM:(R)"
+          Get-Acl "C:\secure\signing_keys\ed25519_key.pem" | Format-List
+
+      - name: Copy test ledger
+        shell: powershell
+        run: Copy-Item core\ledger.log core\ledger.test.log -Force
+
+      - name: Compute next version and sign manifest
+        shell: powershell
+        run: |
+          $tail = Get-Content core\ledger.test.log -Encoding utf8 | Where-Object { $_.Trim() -ne "" } | Select-Object -Last 1 | ConvertFrom-Json
+          $next = [int]$tail.version + 1
+          $prev = $tail.signature_hash
+          python .\core\manifest_generator.py --state-file core\current_state.json --version $next --previous-hash $prev --private-key "C:\secure\signing_keys\ed25519_key.pem" --signer dev-local --out core\run_manifest.signed.json
+
+      - name: Run sentinel verification
+        shell: powershell
+        run: |
+          python .\core\sentinel_copilot1.1.py --manifest core\run_manifest.signed.json --ledger core\ledger.test.log --pubkeys core\pubkeys --outdir core\verify_out_test --no-kms 2>&1 | Tee-Object sentinel_run.log
+          if ($LASTEXITCODE -ne 0) { Write-Host "Sentinel failed"; exit 1 }
+
+      - name: Archive artifacts
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path core\archive | Out-Null
+          Copy-Item -Path core\verify_out_test\* -Destination core\archive -Recurse -Force
+          Copy-Item -Path core\run_manifest.signed.json -Destination core\archive -Force
+
+      - name: Emit CI JSON summary
+        shell: powershell
+        run: |
+          $m = Get-Content -Raw core\run_manifest.signed.json | ConvertFrom-Json
+          $summary = [PSCustomObject]@{
+            version = $m.version
+            previous_hash = $m.previous_hash
+            signature_hash = $m.signature_hash
+            verification = "core/archive/verification.$($m.version).$($m.signature_hash.Substring(0,8)).json"
+          }
+          $summary | ConvertTo-Json -Compress | Out-File -FilePath core\archive\ci_summary.json -Encoding utf8
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: verification-artifacts
+          path: core/archive
