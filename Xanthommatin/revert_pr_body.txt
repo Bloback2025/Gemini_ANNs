@@ -1,0 +1,1 @@
+﻿Reverting accidental merge of recovery-20260911_2145 into main (commit b11e757). Revert commit message: Add verification artifacts and update manifest closure (Brian Lowe).

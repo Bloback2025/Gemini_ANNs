@@ -1,0 +1,32 @@
+# README 1.4: Temporal Convolutional Networks (TCN) Prototyping
+
+## 1. Scope of TCNs in Financial Forecasting
+Temporal Convolutional Networks (TCNs) replace static feature vectors with sliding 3D tensors, utilizing causal and dilated convolutions to map extended chronological sequences without leaking future data. They are structurally optimal for raw primitive financial forecasting.
+
+* **Infinite Receptive Fields:** Dilated convolutions exponentially expand the historical lookback window (e.g., 60 days of contiguous price action) without massively inflating the parameter count.
+* **Causal Strictness:** Causal padding physically restricts the kernel from accessing $t+1$ when predicting $t$, guaranteeing zero look-ahead bias during out-of-sample inference.
+* **Parallel Execution:** TCNs process the entire temporal sequence matrix simultaneously, vastly accelerating GPU training compared to recurrent networks (LSTMs).
+
+## 2. Investigation & Migration Plan
+1. **Tensor Reshaping:** Convert flat `[Samples, Features]` arrays into continuous 3D sequences `[Samples, Timesteps, Features]`. Example: feeding a sliding 10-day window of purely OHLC primitives `(Batch, 10, 4)`.
+2. **Architecture Swap:** Replace the canonical 256-128-64 Dense MLP with a stack of `Conv1D` layers utilizing increasing dilation rates (1, 2, 4, 8) and residual shortcut connections.
+3. **Baseline Benchmarking:** Execute the exact multi-horizon ablation sweeps (t+5, t+10) on the `Sf` and `Ho` datasets to determine if sequence-aware topology compresses the out-of-sample MAE below the established baseline MLP floor.
+
+## 3. Lightweight Prototyping Example
+```python
+from tensorflow.keras import layers, models
+
+# Input: 10 chronological days of 4 primitives (OHLC)
+inp = layers.Input(shape=(10, 4)) 
+
+# Dilated Causal Convolutions mapping the temporal manifold
+x = layers.Conv1D(filters=64, kernel_size=2, padding='causal', dilation_rate=1, activation='relu')(inp)
+x = layers.Conv1D(filters=64, kernel_size=2, padding='causal', dilation_rate=2, activation='relu')(x)
+x = layers.Conv1D(filters=64, kernel_size=2, padding='causal', dilation_rate=4, activation='relu')(x)
+
+# Compress the temporal features for the final linear coordinate prediction
+x = layers.Flatten()(x)
+out = layers.Dense(1, activation='linear')(x)
+
+tcn_model = models.Model(inp, out)
+tcn_model.compile(optimizer='adam', loss='mae')

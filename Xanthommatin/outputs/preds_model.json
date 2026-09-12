@@ -1,0 +1,13 @@
+{
+  "commodity": "GENERIC",
+  "mode": "synthetic",
+  "preds": [
+    {
+      "id": "SYNTH_SMOKE_1",
+      "score": 0.54321
+    }
+  ],
+  "run_id": "outputs",
+  "seed": 20251117,
+  "timestamp": "2026-09-09T00:45:35.112509Z"
+}

@@ -1,0 +1,19 @@
+{
+  "script_name": "advanced_eval_metrics_gem.py",
+  "source_file_name": "preds_model_retest1.json",
+  "source_file_path": "/mnt/c/Users/loweb/AI_Financial_Sims/Gemini_ANNs/artifacts/ho_ann_run_retest1/inference_rebuild/preds_model_retest1.json",
+  "execution_timestamp_utc": "2026-09-08T10:13:15.488875Z",
+  "sample_count": 500,
+  "metrics": {
+    "directional_hit_rate": 0.512,
+    "information_coefficient_spearman": 0.9799829733439342,
+    "ic_p_value": 0.0,
+    "turning_point_precision": 0.5,
+    "turning_point_recall": 0.47876447876447875
+  },
+  "analytical_commentary": [
+    "Directional Hit Rate (51.20%) demonstrates a positive directional edge over random chance (50%).",
+    "Spearman Rank IC (0.9800, p=0) reveals a strong macro-structural rank ordering maintained by the ANN.",
+    "Turning Point Precision (50.00%) highlights high false-positive rates during choppy sideways regimes."
+  ]
+}

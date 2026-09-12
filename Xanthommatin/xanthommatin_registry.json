@@ -1,0 +1,64 @@
+"""
+Module: Xanthommatin Graph State Registry
+Description: Core non-linear memory continuity and structural topology engine.
+Path: core/xanthommatin_registry.json
+"""
+
+import json
+import os
+from datetime import datetime
+from typing import Dict, List, Set, Any, Optional
+
+class GraphStateRegistry:
+    DEFAULT_PATH = "core/xanthommatin_registry.json"
+    VERSION = "1.0.0"
+
+    def __init__(self, storage_path: Optional[str] = None):
+        self.storage_path = storage_path or self.DEFAULT_PATH
+        self.di_core = DeterministicInferenceCore()
+        self.nodes: Dict[str, CognitiveNode] = {}
+        self.transit_planes: Dict[str, OrthogonalPlane] = {}
+
+    def save_state(self, filepath: Optional[str] = None) -> None:
+        """Serializes the registry with metadata header at the top of the JSON."""
+        target_path = filepath or self.storage_path
+
+        data = {
+            "module": "Xanthommatin",
+            "version": self.VERSION,
+            "saved_at": datetime.utcnow().isoformat() + "Z",
+            "di_core": self.di_core.to_dict(),
+            "nodes": {nid: node.to_dict() for nid, node in self.nodes.items()},
+            "transit_planes": {pid: plane.to_dict() for pid, plane in self.transit_planes.items()}
+        }
+
+        os.makedirs(os.path.dirname(os.path.abspath(target_path)), exist_ok=True)
+        
+        with open(target_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4)
+
+    @classmethod
+    def load_state(cls, filepath: Optional[str] = None) -> "GraphStateRegistry":
+        """Restores the cognitive topology directly from the core path."""
+        target_path = filepath or cls.DEFAULT_PATH
+        
+        if not os.path.exists(target_path):
+            raise FileNotFoundError(f"Core registry state not found at: {target_path}")
+
+        with open(target_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        registry = cls(storage_path=target_path)
+        registry.di_core = DeterministicInferenceCore.from_dict(data.get("di_core", {}))
+        
+        registry.nodes = {
+            nid: CognitiveNode.from_dict(ndata) 
+            for nid, ndata in data.get("nodes", {}).items()
+        }
+        
+        registry.transit_planes = {
+            pid: OrthogonalPlane.from_dict(pdata) 
+            for pid, pdata in data.get("transit_planes", {}).items()
+        }
+
+        return registry

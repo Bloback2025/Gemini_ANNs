@@ -1,0 +1,26 @@
+# README 1.3: Advanced Topology & Modernization Roadmap for Commodity ANNs
+
+## 1. Architectural Philosophy: Aggressive Minimalism
+Building upon the empirical validation of our structural ablation framework (see `README_v1.2.md`), the modernization strategy rejects feature bloat in favor of native manifold mapping. Because our ablation audits proved that contemporaneous raw primitives (`Open`, `High`, `Low`, `Close`) contain 100% of the required structural momentum—rendering synthetic a priori lags like `PrevClose` epistemologically redundant—our optimization focus shifts entirely to architectural topology rather than input engineering.
+
+## 2. Next-Generation Modernization Vectors
+
+### A. Native Temporal Manifold Mapping (TCNs & Attention)
+* **The Shift:** Transitioning from static multi-layer perceptrons (MLPs) to sequence-aware architectures like Temporal Convolutional Networks (TCNs) or lightweight Causal Self-Attention blocks.
+* **The Mechanism:** Instead of treating each row as an isolated coordinate, causal convolutions and multi-head attention layers scan raw primitive trajectories over sliding temporal windows. 
+* **Alignment:** Because our data pipeline is strictly primitive-driven, these architectures can dynamically weight volatility boundaries (`High`, `Low`) across time without requiring hand-crafted lookback features.
+
+### B. Dynamic, Rolling Feature Sensitivity Audits
+* **The Shift:** Evolving our static, global ablation suite into a time-varying structural audit.
+* **The Mechanism:** Implementing rolling gradient-based saliency and dynamic perturbation sweeps over sliding out-of-sample windows.
+* **Payoff:** This maps regime-shifting behavior—revealing precisely when the network shifts its structural reliance between volatility brackets during high-beta macro shocks versus mean-reverting market chop.
+
+### C. Shape-Constrained & Geometric Loss Topologies
+* **The Shift:** Enforcing physical market bounds directly into the neural network's architecture and loss functions.
+* **The Mechanism:** Utilizing monotonic activation constraints or geometric regularization to ensure internal representations respect foundational price constraints (e.g., Low <= Open, Close <= High).
+* **Payoff:** Prevents unconstrained ANNs from projecting mathematically impossible price vectors during out-of-sample stress testing.
+
+## 3. Engineering Objectives & Execution Path
+1. **Cross-Asset Isomorphism (Phase 1):** Validate the frozen inference and baseline ablation protocol across heterogeneous historical commodity assets to ensure structural universality.
+2. **Topological Prototyping (Phase 2):** Introduce lightweight temporal attention mechanisms to test whether out-of-sample generalization error (MAE) can be compressed below baseline MLP thresholds without increasing feature dimensionality.
+3. **Live Simulation Integration (Phase 3):** Port validated, primitive-driven rules into execution-grade deployment environments.
