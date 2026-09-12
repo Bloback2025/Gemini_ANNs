@@ -1,0 +1,13 @@
+{
+  "current_state":{
+    "status":"active",
+    "task":"automated verification test"
+  },
+  "manifest_version":"v0.1-beta-closure",
+  "previous_hash":"8a274304d805bfc41090b90a2d020e331e83b2ef9eb1e68c4cc92b1c4a55dae1",
+  "signature":"xVCBJnkaW0RO5ohCrzFaKZB48x9WHEIUpCPxdvJWKvtC6LMC8o73B2W30UrfnEUGX7NYnIKpeLT9xS6wy+r8CA==",
+  "signature_hash":"3648a53089c182eac56075298a455a3f12512165c676273b0ccee58d86ed8315",
+  "signer":"dev-local",
+  "timestamp":"2026-09-11T11:33:13.432463+00:00",
+  "version":5
+}

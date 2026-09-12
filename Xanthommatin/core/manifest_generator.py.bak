@@ -1,0 +1,139 @@
+﻿#!/usr/bin/env python3
+"""
+Author: Brian Lowe
+Copyright (c) 2026 Brian Lowe. All rights reserved.
+File: manifest_generator.py
+Date of Creation: 2026-09-11
+Timestamp: 2026-09-11T00:00:00Z
+Path: Xanthommatin/core/manifest_generator.py
+
+Purpose:
+- Produce a canonical manifest JSON (UTF-8 no BOM) and compute deterministic signature_hash.
+- Optionally attach a base64 signature from a file or sign locally with an Ed25519 private key (dev mode).
+Notes:
+- For production signing use KMS/cosign/sigstore. Do not commit private keys.
+"""
+from __future__ import annotations
+import argparse
+import base64
+import hashlib
+import json
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+try:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives import serialization
+except Exception:
+    Ed25519PrivateKey = None  # type: ignore
+
+def canonical_bytes(obj: Any) -> bytes:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+def compute_sha256_hex(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest().lower()
+
+def write_utf8_nobom(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(text.encode("utf-8"))
+
+def sign_with_private_key_hex(private_key_path: Path, message_hex: str) -> str:
+    if Ed25519PrivateKey is None:
+        raise RuntimeError("cryptography library not available for local signing")
+    data = bytes.fromhex(message_hex)
+    pem = private_key_path.read_bytes()
+    key = serialization.load_pem_private_key(pem, password=None)
+    if not isinstance(key, Ed25519PrivateKey):
+        raise RuntimeError("Provided key is not Ed25519 private key")
+    sig = key.sign(data)
+    return base64.b64encode(sig).decode("ascii")
+
+def build_manifest(
+    current_state: Dict[str, Any],
+    version: int = 1,
+    previous_hash: str = "",
+    signer: str = "",
+    signature_b64: str = "",
+) -> Dict[str, Any]:
+    payload = {
+        "version": int(version),
+        "previous_hash": previous_hash or "",
+        "current_state": current_state,
+    }
+    signature_hash = compute_sha256_hex(canonical_bytes(payload))
+    manifest = {
+        "manifest_version": "v0.1-beta-closure",
+        "version": int(version),
+        "previous_hash": previous_hash or "",
+        "current_state": current_state,
+        "signature_hash": signature_hash,
+        "signer": signer or "",
+        "signature": signature_b64 or "",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    return manifest
+
+def _cli() -> int:
+    p = argparse.ArgumentParser(description="Manifest generator (canonical JSON, signature_hash).")
+    p.add_argument("--out", "-o", default="core/run_manifest.json", help="Output manifest path")
+    p.add_argument("--state-file", "-s", default="", help="Optional JSON file to use as current_state")
+    p.add_argument("--version", "-v", type=int, default=1, help="Manifest version (integer)")
+    p.add_argument("--previous-hash", "-p", default="", help="Previous signature_hash (hex)")
+    p.add_argument("--signer", default="", help="Signer id to include in manifest")
+    p.add_argument("--signature-file", default="", help="Path to base64 signature file to attach")
+    p.add_argument("--private-key", default="", help="(Dev) Path to Ed25519 PEM private key to sign locally")
+    args = p.parse_args()
+
+    out_path = Path(args.out)
+    if args.state_file:
+        sf = Path(args.state_file)
+        if not sf.exists():
+            print(f"ERROR: state file not found: {sf}", file=os.sys.stderr)
+            return 2
+        raw = sf.read_text(encoding="utf-8-sig")
+        current_state = json.loads(raw)
+    else:
+        current_state = {"note": "test-run"}
+
+    signature_b64 = ""
+    if args.signature_file:
+        sf = Path(args.signature_file)
+        if not sf.exists():
+            print(f"ERROR: signature file not found: {sf}", file=os.sys.stderr)
+            return 2
+        signature_b64 = sf.read_text(encoding="utf-8").strip()
+
+    if args.private_key:
+        if Ed25519PrivateKey is None:
+            print("ERROR: cryptography library not available for local signing", file=os.sys.stderr)
+            return 2
+        pk = Path(args.private_key)
+        if not pk.exists():
+            print(f"ERROR: private key not found: {pk}", file=os.sys.stderr)
+            return 2
+        payload = {"version": int(args.version), "previous_hash": args.previous_hash or "", "current_state": current_state}
+        sig_hash = compute_sha256_hex(canonical_bytes(payload))
+        try:
+            signature_b64 = sign_with_private_key_hex(pk, sig_hash)
+            if not args.signer:
+                args.signer = pk.stem
+        except Exception as e:
+            print(f"ERROR: signing failed: {e}", file=os.sys.stderr)
+            return 2
+
+    manifest = build_manifest(current_state, version=args.version, previous_hash=args.previous_hash or "", signer=args.signer or "", signature_b64=signature_b64)
+    manifest_json = json.dumps(manifest, sort_keys=True, indent=2, separators=(",", ":"), ensure_ascii=False)
+    write_utf8_nobom(out_path, manifest_json)
+    print(f"Wrote manifest: {out_path.resolve()}")
+    print(f"signature_hash: {manifest['signature_hash']}")
+    if manifest["signature"]:
+        print("Signature attached in manifest (base64).")
+    else:
+        print("No signature attached. Use your signing tool to sign the hex signature_hash and re-run with --signature-file or use --private-key for local dev signing.")
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(_cli())
+

@@ -1,15 +1,13 @@
-
+#!/usr/bin/env python3
 r"""
-Date of Creation: September 6, 2026, 6:08 PM
-Path: C:\Users\loweb\AI_Financial_Sims\Gemini_ANNs\ho_train_ann_retest1_gem.py
-Original Legacy Source: C:\Users\loweb\AI_Financial_Sims\HO\HO_train_phase_ANNs\ho_train_ann_retest1.py
+Date of Creation: September 8, 2026
+File Name: sf_train_ann_gem.py
+Path: C:/Users/loweb/AI_Financial_Sims/Gemini_ANNs/sf_train_ann_gem.py
 
 Annotations:
-- This is the canonical retest training script rewritten for the Gemini_ANNs project root.
-- Fixes the historical GPU engagement issue by explicitly adding TensorFlow hardware diagnostics and memory growth configuration for WSL2.
-- Eliminates hardcoded absolute legacy Windows paths in favor of clean CLI arguments.
-- Protects against cross-ticker data leakage by incorporating safe `groupby("Ticker")` logic during feature lagging/shifting.
-- Produces model_final.keras, model_best.keras, scaler.json, and RUNLOG.json.
+- Canonical Sf ANN production training script matching the deep 256->128->64 topology.
+- Incorporates L2 regularization (1e-5), Adam optimization (1e-5, clipnorm=0.5), and MAE loss.
+- Serializes model checkpoints, final weights, and normalization scaler parameters.
 """
 
 import os
@@ -27,10 +25,10 @@ from tensorflow.keras import layers, models, callbacks, optimizers, regularizers
 # -------------------------
 # CLI & Paths
 # -------------------------
-parser = argparse.ArgumentParser(description="Canonical HO ANN trainer (retest1 - Gemini version).")
-parser.add_argument("--train_csv", type=str, default="hoxnc_training_retest1.csv", help="Path to training CSV")
-parser.add_argument("--val_csv", type=str, default="hoxnc_validation_retest1.csv", help="Path to validation CSV")
-parser.add_argument("--outdir", type=str, default="artifacts/ho_ann_run_retest1", help="Output directory for artifacts")
+parser = argparse.ArgumentParser(description="Canonical Sf ANN production trainer.")
+parser.add_argument("--train_csv", type=str, default="Sf_training_gem.csv", help="Path to training CSV")
+parser.add_argument("--val_csv", type=str, default="Sf_validation_gem.csv", help="Path to validation CSV")
+parser.add_argument("--outdir", type=str, default="artifacts/sf_ann_run", help="Output directory for artifacts")
 parser.add_argument("--epochs", type=int, default=200, help="Number of training epochs")
 parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
 parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -51,51 +49,39 @@ np.random.seed(SEED)
 tf.random.set_seed(SEED)
 
 # -------------------------
-# GPU Debug & Hardware Safety (Resolves past GPU issues)
-# -------------------------
-print("DEBUG TF version:", tf.__version__)
-gpus = tf.config.list_physical_devices('GPU')
-print("DEBUG TF GPUs:", gpus)
-if gpus:
-    try:
-        for g in gpus:
-            tf.config.experimental.set_memory_growth(g, True)
-        print("✅ GPU Memory Growth Enabled Successfully.")
-    except Exception as e:
-        print(f"⚠️ Warning: Could not set memory growth: {e}")
-else:
-    print("❌ WARNING: No GPU detected by TensorFlow. Execution will fall back to CPU.")
-
-# -------------------------
 # Data helpers
 # -------------------------
-FEATURE_COLS = ["Open", "High", "Low", "Close", "PrevClose"]
-
-def make_features(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.sort_values("Date")
-    # CRITICAL FIX: Safe shifting per ticker if multi-ticker dataset is passed
-    if "Ticker" in df.columns:
-        df["PrevClose"] = df.groupby("Ticker")["Close"].shift(1)
-    else:
-        df["PrevClose"] = df["Close"].shift(1)
-    return df.dropna(subset=FEATURE_COLS)
-
 def load_xy(path: Path):
     if not path.exists():
         raise FileNotFoundError(f"Dataset not found at: {path}")
-    df = pd.read_csv(path, parse_dates=["Date"])
-    df = make_features(df)
-    X = df[FEATURE_COLS].astype(float).values
-    y = df["Close"].astype(float).values
-    return X[:-1], y[1:]
+    df = pd.read_csv(path)
+    
+    # 1. Strip hidden whitespace from column headers (Fixes KeyError)
+    df.columns = df.columns.str.strip()
+    
+    # 2. Enforce chronological order (Fixes reverse-date target leakage)
+    df['Date'] = pd.to_datetime(df['Date'])
+    df = df.sort_values('Date', ascending=True).reset_index(drop=True)
+    
+    # 3. Engineer PrevClose to match HO baseline feature set
+    df['PrevClose'] = df['Close'].shift(1)
+    df = df.dropna()
+    
+    # 4. Extract aligned matrices
+    feature_cols = ['Open', 'High', 'Low', 'Close', 'PrevClose']
+    X = df[feature_cols].astype(float).values
+    y = df['Close'].astype(float).values
+    
+    # 5. Temporal alignment: X_t predicts y_{t+1}
+    return X[:-1], y[1:], feature_cols
 
 # -------------------------
 # Load Data
 # -------------------------
 print(f"Loading training data from {TRAIN_CSV}...")
-X_train, y_train = load_xy(TRAIN_CSV)
+X_train, y_train, feature_cols = load_xy(TRAIN_CSV)
 print(f"Loading validation data from {VAL_CSV}...")
-X_val,   y_val   = load_xy(VAL_CSV)
+X_val, y_val, _ = load_xy(VAL_CSV)
 
 # -------------------------
 # Scaling
@@ -111,7 +97,7 @@ y_train_n = (y_train - y_mu) / y_sigma
 y_val_n   = (y_val   - y_mu) / y_sigma
 
 # -------------------------
-# Model Architecture
+# Model Architecture (Production Topology)
 # -------------------------
 inp = layers.Input(shape=(X_train_n.shape[1],))
 x = layers.Dense(256, activation="relu", kernel_regularizer=regularizers.l2(1e-5))(inp)
@@ -129,7 +115,7 @@ es = callbacks.EarlyStopping(monitor="val_loss", patience=15, restore_best_weigh
 ckpt_path = OUTDIR / "model_best.keras"
 ckpt = callbacks.ModelCheckpoint(str(ckpt_path), save_best_only=True, monitor="val_loss")
 
-print("Starting model training loop...")
+print("Starting production training loop...")
 history = model.fit(
     X_train_n, y_train_n,
     validation_data=(X_val_n, y_val_n),
@@ -146,12 +132,12 @@ model.save(str(final_model_path))
 # Artifact Export (Scaler & Runlog)
 # -------------------------
 scaler = {
-    "feature_cols": FEATURE_COLS,
+    "feature_cols": feature_cols,
     "mu": mu.tolist(),
     "sigma": sigma.tolist(),
     "target_mu": y_mu,
     "target_sigma": y_sigma,
-    "target_type": "standardized_close"
+    "target_type": "standardized_target"
 }
 scaler_file_path = OUTDIR / "scaler.json"
 with open(scaler_file_path, "w") as f:
@@ -164,8 +150,7 @@ runlog = {
     "training_rows": int(X_train.shape[0]),
     "validation_rows": int(X_val.shape[0]),
     "epochs_ran": int(len(history.history.get("loss", []))),
-    "run_timestamp_utc": datetime.utcnow().isoformat() + "Z",
-    "gpu_devices": [str(g) for g in gpus] if gpus else []
+    "run_timestamp_utc": datetime.utcnow().isoformat() + "Z"
 }
 runlog_file_path = OUTDIR / "RUNLOG.json"
 with open(runlog_file_path, "w") as f:

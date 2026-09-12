@@ -1,0 +1,24 @@
+{
+  "commodity": "GENERIC",
+  "determinism_measures": {
+    "PYTHONHASHSEED_set": "20251117",
+    "TF_CUDNN_DETERMINISTIC": "1",
+    "TF_DETERMINISTIC_OPS": "1",
+    "numpy_seed_set": 20251117,
+    "tf_seed_set": 20251117,
+    "tf_threading_set": true
+  },
+  "environment": {
+    "python": "3.13.2"
+  },
+  "input_files": {},
+  "manifest_version": "xanthommatin-v1-closure",
+  "mode": "synthetic",
+  "outputs": {
+    "preds": "outputs\\preds_model.json",
+    "preds_sha_lower": "041648098ad66d0150738afe0d1581803fae13c7d65ff8411cdb4be31176c14b",
+    "preds_sha_upper": "041648098AD66D0150738AFE0D1581803FAE13C7D65FF8411CDB4BE31176C14B"
+  },
+  "seed": 20251117,
+  "timestamp": "2026-09-09T00:45:35.117781Z"
+}
